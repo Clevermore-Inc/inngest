@@ -1,0 +1,87 @@
+# Clevermore build of the self-hosted Inngest server (CLE-2334).
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# We run a patched build carrying one fix: the queue scan loops treat a
+# transient network error from the state store (a Redis socket read timing out,
+# a connection reset, a DNS hiccup) as retryable instead of fatal. Upstream
+# retries only context.DeadlineExceeded, so a socket deadline --
+# os.ErrDeadlineExceeded, a different sentinel that prints as "i/o timeout" --
+# fell through to the fatal path and exited the process. See
+# pkg/execution/queue/scan.go and the upstream PR linked from CLE-2334.
+#
+# WHY NOT THE UPSTREAM Dockerfile
+# -------------------------------
+# The repo's checked-in `Dockerfile` does not build a clean checkout: it runs
+# `go build cmd/main.go`, which compiles that single file and fails on
+# `undefined: execute` (execute lives in cmd/root.go). Releases are actually
+# cut by goreleaser, whose `before` hooks run `make build-ui` first and whose
+# builds stanza targets `./cmd`. This file reproduces that real recipe.
+#
+# The dev-server UI is NOT an optional extra: `inngest start` runs
+# devserver.New() and serves the dashboard on 8288 unless --no-ui is passed,
+# and pkg/devserver/ui.go pulls the built assets in via `go:embed all:static`.
+# Skipping the UI build would silently ship a server with no dashboard.
+
+# syntax=docker/dockerfile:1
+
+# ---- Stage 1: dev-server UI, embedded into the Go binary ---------------------
+FROM node:20-alpine AS ui
+RUN corepack enable
+WORKDIR /src
+# The pnpm workspace root is ui/, so the whole directory has to come along for
+# --frozen-lockfile to resolve.
+COPY ui ui
+# graphql-codegen reads the schema from OUTSIDE the ui tree:
+# ui/apps/dev-server-ui/codegen.ts points at '../../../pkg/coreapi/**/*.graphql'.
+# Without this the build fails in codegen, not in vite.
+COPY pkg/coreapi pkg/coreapi
+WORKDIR /src/ui/apps/dev-server-ui
+RUN pnpm install --frozen-lockfile
+RUN pnpm build
+
+# ---- Stage 2: patched Go binary ---------------------------------------------
+FROM --platform=$BUILDPLATFORM golang:1.25.9-alpine AS build
+RUN apk add --no-cache build-base
+WORKDIR /app
+COPY . .
+
+# What `make build-ui` does after building: drop the assets where go:embed
+# all:static expects them.
+COPY --from=ui /src/ui/apps/dev-server-ui/dist/ ./pkg/devserver/static/
+
+# internal/embeddocs embeds the inngest/website git submodule, which is a
+# separate repo we deliberately do not clone -- it is the public docs site,
+# ~hundreds of MB, and its only consumer is the dev server's MCP docs tool
+# (pkg/devserver/mcp.go), which we never invoke. The embed is a COMPILE-time
+# requirement though, so the pattern has to match at least one file.
+RUN mkdir -p internal/embeddocs/website/pages/docs && \
+    printf '%s\n' \
+      'Placeholder. The inngest/website submodule is not cloned in this build;' \
+      'see Dockerfile.clevermore. Only the dev server MCP docs tool reads this.' \
+      > internal/embeddocs/website/pages/docs/placeholder.md
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG TARGETARCH
+ARG TARGETOS
+# Flags mirror .goreleaser.yml: CGO off, same ldflags so `inngest version`
+# reports something meaningful.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    GOFLAGS=-mod=vendor CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+      -ldflags "-s -w -X github.com/inngest/inngest/pkg/inngest/version.Version=${VERSION} -X github.com/inngest/inngest/pkg/inngest/version.Hash=${COMMIT}" \
+      -o /go/bin/inngest ./cmd
+
+# ---- Stage 3: runtime -------------------------------------------------------
+# Matches Dockerfile.goreleaser (debian:stable-slim) so the runtime is identical
+# to the official image. Note our Container App overrides CMD with a
+# `/bin/sh -c` wrapper to assemble INNGEST_POSTGRES_URI -- /bin/sh is present
+# here, as it is upstream.
+FROM debian:stable-slim AS inngest
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /go/bin/inngest /bin/inngest
+CMD ["inngest"]
