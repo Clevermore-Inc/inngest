@@ -26,7 +26,10 @@
 # syntax=docker/dockerfile:1
 
 # ---- Stage 1: dev-server UI, embedded into the Go binary ---------------------
-FROM node:20-alpine AS ui
+# Pinned to BUILDPLATFORM: the output is platform-independent JS/CSS that the
+# Go stage embeds, so building it for the *target* arch would only buy minutes
+# of QEMU emulation when cross-building (e.g. arm64 laptop -> amd64 image).
+FROM --platform=$BUILDPLATFORM node:20-alpine AS ui
 RUN corepack enable
 WORKDIR /src
 # The pnpm workspace root is ui/, so the whole directory has to come along for
