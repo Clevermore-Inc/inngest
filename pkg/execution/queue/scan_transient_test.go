@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"syscall"
@@ -49,6 +50,17 @@ func TestIsTransientScanError(t *testing.T) {
 			err:  fmt.Errorf("could not peek global partitions: %w", context.DeadlineExceeded),
 			want: true,
 		},
+		{
+			// The production signature of a server-side disconnect during a
+			// peek: rueidis surfaces the bare io.EOF from net.Conn.Read.
+			name: "connection closed mid-command, wrapped by the scan call chain",
+			err: fmt.Errorf("error scanning partition: %w",
+				fmt.Errorf("could not peek global partitions: %w",
+					fmt.Errorf("error peeking partition items: %w", io.EOF))),
+			want: true,
+		},
+		{"bare io.EOF", io.EOF, true},
+		{"connection closed mid-reply", io.ErrUnexpectedEOF, true},
 		{
 			name: "connection reset by peer",
 			err:  &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
