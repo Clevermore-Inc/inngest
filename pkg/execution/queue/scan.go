@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -39,6 +40,17 @@ func isTransientScanError(err error) bool {
 	}
 	// A deadline hit at the socket layer.
 	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	// The backing store closed the connection while a command was in flight.
+	// net.Conn.Read returns a bare io.EOF on an orderly close (not wrapped in
+	// *net.OpError), and the Redis client passes it straight through, so a
+	// server-side disconnect during a peek printed as "error peeking partition
+	// items: EOF" and took the process down. io.ErrUnexpectedEOF is the same
+	// close landing mid-reply. Neither is a permanent fault: the client redials
+	// on the next command, and a store that stays down surfaces as a dial
+	// error, which is already treated as transient below.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	// Any network-layer failure talking to the backing store: timeouts,
